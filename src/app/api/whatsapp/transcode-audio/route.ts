@@ -105,6 +105,12 @@ export async function POST(request: Request) {
       await writeFile(inputPath, Buffer.from(await file.arrayBuffer()))
       await runFfmpeg(ffmpegPath, buildFfmpegArgs(inputPath, outputPath))
       const ogg = await readFile(outputPath)
+      if (ogg.byteLength > MAX_INPUT_BYTES) {
+        return NextResponse.json(
+          { error: 'Transcoded audio exceeds the 16 MB limit.' },
+          { status: 400 },
+        )
+      }
       return new Response(new Uint8Array(ogg), {
         status: 200,
         headers: {

@@ -18,6 +18,22 @@ import { createClient } from "@/lib/supabase/client";
 export const MEDIA_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
+ * Per-kind upload ceilings that mirror Meta's WhatsApp Cloud API caps so
+ * a file that the bucket would accept (≤16 MB) but Meta would reject is
+ * caught client-side BEFORE upload — otherwise it lands in storage as an
+ * orphan and the send fails with a confusing 400. Images are Meta's
+ * tightest cap at 5 MB; documents are held at the 16 MB bucket limit
+ * (Meta allows 100 MB, but the bucket — and shared-hosting upload UX —
+ * caps lower).
+ */
+export const MEDIA_MAX_BYTES_BY_KIND = {
+  image: 5 * 1024 * 1024,
+  video: 16 * 1024 * 1024,
+  audio: 16 * 1024 * 1024,
+  document: 16 * 1024 * 1024,
+} as const;
+
+/**
  * Build the account-scoped object path for an upload. Pure + exported so
  * it can be unit-tested without a Supabase client.
  *
@@ -99,4 +115,23 @@ export async function uploadAccountMedia(
   } = supabase.storage.from(bucket).getPublicUrl(path);
 
   return { publicUrl, path };
+}
+
+/**
+ * Delete a previously-uploaded object. Used to GC media that was staged
+ * (uploaded) but never sent — a cancelled draft or a failed Meta send —
+ * so abandoned attachments don't accumulate in the public bucket. The
+ * DELETE is gated by the same account-scoped RLS policy as the upload,
+ * so a caller can only remove objects under their own account folder.
+ *
+ * Best-effort: callers fire-and-forget and swallow errors (a missed
+ * delete is a storage nit, not something to surface to the user).
+ */
+export async function deleteAccountMedia(
+  bucket: string,
+  path: string,
+): Promise<void> {
+  const supabase = createClient();
+  const { error } = await supabase.storage.from(bucket).remove([path]);
+  if (error) throw new Error(error.message);
 }

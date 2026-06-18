@@ -32,18 +32,30 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import {
   uploadAccountMedia,
-  MEDIA_MAX_BYTES,
+  deleteAccountMedia,
+  MEDIA_MAX_BYTES_BY_KIND,
 } from "@/lib/storage/upload-media";
-import { isMetaAcceptedAudio } from "@/lib/whatsapp/audio-transcode";
 import { ReplyQuote } from "./reply-quote";
 
 /** Media content types an agent can send from the composer. */
 export type ComposerMediaKind = "image" | "video" | "document" | "audio";
 
+/** Supabase Storage bucket holding agent-sent chat attachments (migration 023). */
+export const CHAT_MEDIA_BUCKET = "chat-media";
+
+/** Meta caps media captions at 1024 chars. Enforced here and in the send route. */
+export const MEDIA_CAPTION_MAX = 1024;
+
+/** Hard cap on a single voice recording so it can't blow the upload/
+ *  transcode limits — auto-stops the recorder when reached. */
+const MAX_RECORDING_SECONDS = 5 * 60;
+
 export interface SendMediaPayload {
   kind: ComposerMediaKind;
   /** Public chat-media URL Meta fetches at send time. */
   mediaUrl: string;
+  /** Storage object path — lets the caller GC the object if the send fails. */
+  path: string;
   /** Optional caption (image/video/document only). */
   caption?: string;
   /** Original file name — surfaced to the recipient for documents. */
@@ -57,8 +69,6 @@ interface ReplyDraft {
   authorLabel: string;
   preview: string;
 }
-
-const CHAT_MEDIA_BUCKET = "chat-media";
 
 // Mirrors the chat-media bucket's allowed_mime_types (migration 023) for
 // the file picker so unsupported files are rejected before upload rather
@@ -74,6 +84,8 @@ const PICKER_ACCEPT: Record<"image" | "video" | "document", string> = {
 interface MediaDraft {
   kind: ComposerMediaKind;
   mediaUrl: string;
+  /** Storage path — used to GC the object if the draft is discarded. */
+  path: string;
   filename: string;
   caption: string;
 }
@@ -94,19 +106,13 @@ function formatDuration(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/**
- * Map a Meta-accepted audio MIME to a file extension for the upload path.
- * Recordings that aren't already accepted are transcoded to OGG upstream,
- * so this only ever sees accepted types.
- */
-function audioExtForMime(mime: string): string {
-  const base = mime.split(";")[0];
-  if (base.includes("ogg")) return "ogg";
-  if (base.includes("mp4")) return "m4a";
-  if (base.includes("mpeg")) return "mp3";
-  if (base.includes("aac")) return "aac";
-  if (base.includes("amr")) return "amr";
-  return "ogg";
+/** A recording can skip the transcode round-trip only if it's already
+ *  OGG/Opus — the one format WhatsApp reliably renders as a voice note
+ *  with a waveform. Everything else (Chromium WebM, Safari MP4/AAC) is
+ *  remuxed server-side so the voice-note UX is consistent across
+ *  browsers, not a plain audio attachment on some of them. */
+function isOggOpus(mime: string): boolean {
+  return mime.split(";")[0].trim().toLowerCase() === "audio/ogg";
 }
 
 export function MessageComposer({
@@ -129,6 +135,19 @@ export function MessageComposer({
   const imageInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
   const documentInputRef = useRef<HTMLInputElement>(null);
+  // Mirror of `draft` for the unmount cleanup, which can't read render
+  // state. Kept in sync below so navigating away with a staged-but-unsent
+  // attachment GCs the orphaned object.
+  const draftRef = useRef<MediaDraft | null>(null);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+
+  // Best-effort GC of a staged object the user never sent. Fire-and-forget.
+  const removeStaged = useCallback((path: string | undefined) => {
+    if (!path) return;
+    void deleteAccountMedia(CHAT_MEDIA_BUCKET, path).catch(() => {});
+  }, []);
 
   // Voice recording state.
   const [recording, setRecording] = useState(false);
@@ -155,13 +174,15 @@ export function MessageComposer({
   }, []);
 
   // Tear down any live recording + timer on unmount so a mid-record
-  // navigation doesn't leak the mic.
+  // navigation doesn't leak the mic, and GC a staged-but-unsent
+  // attachment so it doesn't orphan in the bucket.
   useEffect(() => {
     return () => {
       clearTimer();
       streamRef.current?.getTracks().forEach((t) => t.stop());
+      removeStaged(draftRef.current?.path);
     };
-  }, [clearTimer]);
+  }, [clearTimer, removeStaged]);
 
   const adjustHeight = useCallback(() => {
     const el = textareaRef.current;
@@ -208,23 +229,31 @@ export function MessageComposer({
   // Upload a captured file to chat-media and stage it as a draft.
   const stageUpload = useCallback(
     async (kind: ComposerMediaKind, file: File) => {
-      if (file.size > MEDIA_MAX_BYTES) {
+      // Per-kind ceiling mirrors Meta's caps (image 5 MB, etc.) so we
+      // reject before upload rather than orphaning an object that Meta
+      // would then refuse at send.
+      const max = MEDIA_MAX_BYTES_BY_KIND[kind];
+      if (file.size > max) {
         toast.error(
-          `File is ${(file.size / 1024 / 1024).toFixed(1)} MB — limit is 16 MB.`,
+          `File is ${(file.size / 1024 / 1024).toFixed(1)} MB — ${kind} limit is ${Math.round(
+            max / 1024 / 1024,
+          )} MB.`,
         );
         return;
       }
       setBusy(true);
       try {
-        const { publicUrl } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
-        setDraft({ kind, mediaUrl: publicUrl, filename: file.name, caption: "" });
+        const { publicUrl, path } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
+        // Replacing an existing draft? GC the previous object first.
+        removeStaged(draftRef.current?.path);
+        setDraft({ kind, mediaUrl: publicUrl, path, filename: file.name, caption: "" });
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Upload failed.");
       } finally {
         setBusy(false);
       }
     },
-    [],
+    [removeStaged],
   );
 
   const handlePicked = useCallback(
@@ -241,16 +270,12 @@ export function MessageComposer({
       setBusy(true);
       try {
         let file: File;
-        if (isMetaAcceptedAudio(mime)) {
-          // Firefox (ogg) / Safari (mp4) already give a Meta-accepted
-          // format — upload as-is.
-          const base = mime.split(";")[0];
-          file = new File([blob], `voice-${Date.now()}.${audioExtForMime(mime)}`, {
-            type: base,
-          });
+        if (isOggOpus(mime)) {
+          // Firefox records OGG/Opus directly — upload as-is.
+          file = new File([blob], `voice-${Date.now()}.ogg`, { type: "audio/ogg" });
         } else {
-          // Chromium records WebM/Opus, which Meta rejects — remux to
-          // OGG/Opus server-side first.
+          // Chromium (WebM) and Safari (MP4) are remuxed to OGG/Opus so
+          // WhatsApp renders a voice note, not a plain audio attachment.
           const form = new FormData();
           form.append("file", blob, "recording");
           const res = await fetch("/api/whatsapp/transcode-audio", {
@@ -264,19 +289,20 @@ export function MessageComposer({
           const ogg = await res.blob();
           file = new File([ogg], `voice-${Date.now()}.ogg`, { type: "audio/ogg" });
         }
-        if (file.size > MEDIA_MAX_BYTES) {
+        if (file.size > MEDIA_MAX_BYTES_BY_KIND.audio) {
           toast.error("Recording is too long (over 16 MB).");
           return;
         }
-        const { publicUrl } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
-        setDraft({ kind: "audio", mediaUrl: publicUrl, filename: file.name, caption: "" });
+        const { publicUrl, path } = await uploadAccountMedia(CHAT_MEDIA_BUCKET, file);
+        removeStaged(draftRef.current?.path);
+        setDraft({ kind: "audio", mediaUrl: publicUrl, path, filename: file.name, caption: "" });
       } catch (err) {
         toast.error(err instanceof Error ? err.message : "Could not process the recording.");
       } finally {
         setBusy(false);
       }
     },
-    [],
+    [removeStaged],
   );
 
   const startRecording = useCallback(async () => {
@@ -333,6 +359,14 @@ export function MessageComposer({
     recorderRef.current?.stop();
   }, [clearTimer]);
 
+  // Auto-stop at the cap so a forgotten recording can't blow the
+  // upload/transcode limits.
+  useEffect(() => {
+    if (recording && recordSeconds >= MAX_RECORDING_SECONDS) {
+      stopRecording();
+    }
+  }, [recording, recordSeconds, stopRecording]);
+
   // ---- Draft send / discard -----------------------------------------
 
   const sendDraft = useCallback(() => {
@@ -340,6 +374,7 @@ export function MessageComposer({
     onSendMedia({
       kind: draft.kind,
       mediaUrl: draft.mediaUrl,
+      path: draft.path,
       // Audio takes no caption (Meta rejects it). Everything else: the
       // trimmed caption, or undefined when blank.
       caption:
@@ -347,85 +382,22 @@ export function MessageComposer({
       filename: draft.kind === "document" ? draft.filename : undefined,
       replyToId: replyTo?.id,
     });
+    // The object is now owned by the sent message — clear without GC.
     setDraft(null);
     onClearReply?.();
   }, [draft, busy, onSendMedia, replyTo?.id, onClearReply]);
 
-  const discardDraft = useCallback(() => setDraft(null), []);
+  // Discard GCs the staged object — it was uploaded but never sent.
+  const discardDraft = useCallback(() => {
+    removeStaged(draft?.path);
+    setDraft(null);
+  }, [draft?.path, removeStaged]);
+
+  const setCaption = useCallback((caption: string) => {
+    setDraft((d) => (d ? { ...d, caption } : d));
+  }, []);
 
   // ---- Render --------------------------------------------------------
-
-  const DraftPreview = () => {
-    if (!draft) return null;
-    return (
-      <div className="rounded-xl border border-border bg-muted/40 p-3">
-        <div className="flex items-start gap-3">
-          <div className="min-w-0 flex-1">
-            {draft.kind === "image" && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={draft.mediaUrl}
-                alt={draft.filename}
-                className="max-h-40 rounded-lg object-cover"
-              />
-            )}
-            {draft.kind === "video" && (
-              <video src={draft.mediaUrl} controls className="max-h-40 rounded-lg" />
-            )}
-            {draft.kind === "audio" && (
-              <audio src={draft.mediaUrl} controls className="w-full" />
-            )}
-            {draft.kind === "document" && (
-              <div className="flex items-center gap-2 text-sm text-foreground">
-                <FileText className="h-5 w-5 shrink-0 text-muted-foreground" />
-                <span className="truncate">{draft.filename}</span>
-              </div>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={discardDraft}
-            aria-label="Remove attachment"
-            className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-
-        <div className="mt-2 flex items-end gap-2">
-          {draft.kind !== "audio" && (
-            <input
-              value={draft.caption}
-              onChange={(e) =>
-                setDraft((d) => (d ? { ...d, caption: e.target.value } : d))
-              }
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  sendDraft();
-                }
-              }}
-              placeholder="Add a caption…"
-              className="flex-1 rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50"
-            />
-          )}
-          <GatedButton
-            size="sm"
-            canAct={!readOnly}
-            gateReason="send messages"
-            disabled={busy}
-            onClick={sendDraft}
-            className={cn(
-              "h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40",
-              draft.kind === "audio" && "ml-auto",
-            )}
-          >
-            <Send className="h-4 w-4" />
-          </GatedButton>
-        </div>
-      </div>
-    );
-  };
 
   return (
     <div className="border-t border-border bg-card p-3">
@@ -488,13 +460,21 @@ export function MessageComposer({
       />
 
       {draft ? (
-        <DraftPreview />
+        <MediaDraftPreview
+          draft={draft}
+          busy={busy}
+          readOnly={readOnly}
+          onCaptionChange={setCaption}
+          onDiscard={discardDraft}
+          onSend={sendDraft}
+        />
       ) : recording ? (
         // Recording bar — replaces the composer while the mic is live.
         <div className="flex items-center gap-3 rounded-xl border border-border bg-muted px-4 py-2.5">
           <span className="flex h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-red-500" />
           <span className="flex-1 text-sm text-foreground">
-            Recording… {formatDuration(recordSeconds)}
+            Recording… {formatDuration(recordSeconds)} /{" "}
+            {formatDuration(MAX_RECORDING_SECONDS)}
           </span>
           <button
             type="button"
@@ -610,6 +590,96 @@ export function MessageComposer({
           Type &apos;/&apos; for quick replies
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * Staged-attachment preview with caption + send/discard. Declared at
+ * module scope (not nested in MessageComposer) so React keeps it mounted
+ * across the parent's re-renders — a nested component would remount the
+ * caption input on every keystroke and drop focus.
+ */
+function MediaDraftPreview({
+  draft,
+  busy,
+  readOnly,
+  onCaptionChange,
+  onDiscard,
+  onSend,
+}: {
+  draft: MediaDraft;
+  busy: boolean;
+  readOnly: boolean;
+  onCaptionChange: (caption: string) => void;
+  onDiscard: () => void;
+  onSend: () => void;
+}) {
+  return (
+    <div className="rounded-xl border border-border bg-muted/40 p-3">
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          {draft.kind === "image" && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={draft.mediaUrl}
+              alt={draft.filename}
+              className="max-h-40 rounded-lg object-cover"
+            />
+          )}
+          {draft.kind === "video" && (
+            <video src={draft.mediaUrl} controls className="max-h-40 rounded-lg" />
+          )}
+          {draft.kind === "audio" && (
+            <audio src={draft.mediaUrl} controls className="w-full" />
+          )}
+          {draft.kind === "document" && (
+            <div className="flex items-center gap-2 text-sm text-foreground">
+              <FileText className="h-5 w-5 shrink-0 text-muted-foreground" />
+              <span className="truncate">{draft.filename}</span>
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={onDiscard}
+          aria-label="Remove attachment"
+          className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+
+      <div className="mt-2 flex items-end gap-2">
+        {draft.kind !== "audio" && (
+          <input
+            value={draft.caption}
+            maxLength={MEDIA_CAPTION_MAX}
+            onChange={(e) => onCaptionChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                onSend();
+              }
+            }}
+            placeholder="Add a caption…"
+            className="flex-1 rounded-xl border border-border bg-muted px-4 py-2.5 text-sm text-foreground placeholder-muted-foreground outline-none transition-colors focus:border-primary/50"
+          />
+        )}
+        <GatedButton
+          size="sm"
+          canAct={!readOnly}
+          gateReason="send messages"
+          disabled={busy}
+          onClick={onSend}
+          className={cn(
+            "h-9 w-9 shrink-0 bg-primary p-0 hover:bg-primary/90 disabled:opacity-40",
+            draft.kind === "audio" && "ml-auto",
+          )}
+        >
+          <Send className="h-4 w-4" />
+        </GatedButton>
+      </div>
     </div>
   );
 }

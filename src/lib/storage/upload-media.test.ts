@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildMediaPath } from "./upload-media";
+import { buildMediaPath, MEDIA_MAX_BYTES_BY_KIND } from "./upload-media";
 
 const ACCOUNT = "11111111-2222-3333-4444-555555555555";
 
@@ -30,5 +30,17 @@ describe("buildMediaPath", () => {
   it("defaults the extension to bin when there is none", () => {
     const path = buildMediaPath(ACCOUNT, "README", 1700000000000);
     expect(path).toBe(`account-${ACCOUNT}/1700000000000-README.bin`);
+  });
+});
+
+describe("MEDIA_MAX_BYTES_BY_KIND", () => {
+  it("caps images at Meta's tighter 5 MB limit", () => {
+    expect(MEDIA_MAX_BYTES_BY_KIND.image).toBe(5 * 1024 * 1024);
+  });
+
+  it("caps video/audio/document at the 16 MB bucket limit", () => {
+    expect(MEDIA_MAX_BYTES_BY_KIND.video).toBe(16 * 1024 * 1024);
+    expect(MEDIA_MAX_BYTES_BY_KIND.audio).toBe(16 * 1024 * 1024);
+    expect(MEDIA_MAX_BYTES_BY_KIND.document).toBe(16 * 1024 * 1024);
   });
 });

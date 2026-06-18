@@ -88,6 +88,16 @@ export async function POST(request: Request) {
     const MEDIA_KINDS = ['image', 'video', 'document', 'audio'] as const
     const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(message_type)
 
+    // Reject anything outside the known set up front rather than letting
+    // an unknown type fall through to the text path with empty content.
+    const VALID_MESSAGE_TYPES = ['text', 'template', ...MEDIA_KINDS] as const
+    if (!(VALID_MESSAGE_TYPES as readonly string[]).includes(message_type)) {
+      return NextResponse.json(
+        { error: `Unsupported message_type "${message_type}"` },
+        { status: 400 }
+      )
+    }
+
     if (message_type === 'text' && !content_text) {
       return NextResponse.json(
         { error: 'content_text is required for text messages' },
@@ -105,6 +115,20 @@ export async function POST(request: Request) {
     if (isMediaKind && !media_url) {
       return NextResponse.json(
         { error: `media_url is required for ${message_type} messages` },
+        { status: 400 }
+      )
+    }
+
+    // Meta caps media captions at 1024 chars; reject before the upload is
+    // wasted at the Meta call. (Audio carries no caption — see meta-api.)
+    if (
+      isMediaKind &&
+      message_type !== 'audio' &&
+      typeof content_text === 'string' &&
+      content_text.length > 1024
+    ) {
+      return NextResponse.json(
+        { error: 'Caption exceeds the 1024-character limit' },
         { status: 400 }
       )
     }
