@@ -3,6 +3,9 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
+import { usePresence } from "@/hooks/use-presence";
+import { PresenceDot } from "@/components/presence/presence-dot";
+import { presenceLabel } from "@/lib/presence";
 import { cn } from "@/lib/utils";
 import type {
   Conversation,
@@ -163,6 +166,7 @@ export function MessageThread({
   onToggleContactPanel,
 }: MessageThreadProps) {
   const { user } = useAuth();
+  const { getPresence, getRow, now } = usePresence();
   const [loading, setLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
@@ -949,6 +953,7 @@ export function MessageThread({
               ) : (
                 profiles.map((p) => {
                   const isSelected = p.user_id === assignedAgentId;
+                  const presence = getPresence(p.user_id);
                   return (
                     <DropdownMenuItem
                       key={p.id}
@@ -958,6 +963,15 @@ export function MessageThread({
                         isSelected ? "text-primary" : "text-popover-foreground"
                       )}
                     >
+                      <PresenceDot
+                        status={presence}
+                        label={presenceLabel(
+                          presence,
+                          getRow(p.user_id)?.last_seen_at ?? null,
+                          now
+                        )}
+                        className="mr-2"
+                      />
                       <span className="flex-1">
                         {p.full_name}
                         {p.user_id === user?.id ? " (me)" : ""}

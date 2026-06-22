@@ -33,8 +33,18 @@ import {
   UsersRound,
 } from 'lucide-react';
 
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import {
+  Avatar,
+  AvatarBadge,
+  AvatarFallback,
+  AvatarImage,
+} from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import {
@@ -54,7 +64,13 @@ import {
 } from '@/components/ui/select';
 import { RequireRole } from '@/components/auth/require-role';
 import { useAuth } from '@/hooks/use-auth';
+import { usePresence } from '@/hooks/use-presence';
 import type { AccountRole } from '@/lib/auth/roles';
+import { presenceLabel, summarize } from '@/lib/presence';
+import {
+  PRESENCE_DOT_CLASS,
+  PresenceDot,
+} from '@/components/presence/presence-dot';
 import { InviteMemberDialog } from './invite-member-dialog';
 import { SettingsPanelHead } from './settings-panel-head';
 import { ROLE_META } from './role-meta';
@@ -110,6 +126,7 @@ function fmtExpiresIn(iso: string): string {
 
 export function MembersTab() {
   const { user, canManageMembers } = useAuth();
+  const { getPresence, getRow, now } = usePresence();
 
   const [members, setMembers] = useState<Member[]>([]);
   const [invitations, setInvitations] = useState<Invitation[]>([]);
@@ -276,6 +293,32 @@ export function MembersTab() {
         }
       />
 
+      {/* Live presence summary across the roster. Updates without a
+          full refresh as heartbeats and the local re-derive tick land. */}
+      {members.length > 0 &&
+        (() => {
+          const counts = summarize(members.map((m) => getPresence(m.user_id)));
+          return (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              <span className="inline-flex items-center gap-1.5">
+                <PresenceDot status="online" />
+                {counts.online} online
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <PresenceDot status="away" />
+                {counts.away} away
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <PresenceDot status="offline" />
+                {counts.offline} offline
+              </span>
+              <span className="text-muted-foreground/70">
+                · {members.length} member{members.length === 1 ? '' : 's'}
+              </span>
+            </div>
+          );
+        })()}
+
       {/* Roster */}
       <Card>
         <CardContent className="p-0">
@@ -286,6 +329,13 @@ export function MembersTab() {
               const isSelf = member.user_id === user?.id;
               const isOwnerRow = member.role === 'owner';
               const isBusy = pendingMemberAction === member.user_id;
+              const presence = getPresence(member.user_id);
+              const presenceRow = getRow(member.user_id);
+              const presenceText = presenceLabel(
+                presence,
+                presenceRow?.last_seen_at ?? null,
+                now,
+              );
 
               return (
                 <li
@@ -298,19 +348,35 @@ export function MembersTab() {
                   className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:gap-4"
                 >
                   <div className="flex min-w-0 flex-1 items-center gap-4">
-                    <Avatar className="size-9 shrink-0">
-                      {member.avatar_url ? (
-                        <AvatarImage
-                          src={member.avatar_url}
-                          alt={member.full_name || 'Member'}
-                        />
-                      ) : null}
-                      <AvatarFallback className="bg-primary/10 text-sm font-medium text-primary">
-                        {(member.full_name || member.email || 'U')
-                          .charAt(0)
-                          .toUpperCase()}
-                      </AvatarFallback>
-                    </Avatar>
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <Avatar className="size-9 shrink-0">
+                            {member.avatar_url ? (
+                              <AvatarImage
+                                src={member.avatar_url}
+                                alt={member.full_name || 'Member'}
+                              />
+                            ) : null}
+                            <AvatarFallback className="bg-primary/10 text-sm font-medium text-primary">
+                              {(member.full_name || member.email || 'U')
+                                .charAt(0)
+                                .toUpperCase()}
+                            </AvatarFallback>
+                            {/* role+label so screen readers announce
+                                presence — the hover tooltip alone isn't
+                                reachable by keyboard/AT on a non-focusable
+                                avatar. */}
+                            <AvatarBadge
+                              role="img"
+                              aria-label={presenceText}
+                              className={PRESENCE_DOT_CLASS[presence]}
+                            />
+                          </Avatar>
+                        }
+                      />
+                      <TooltipContent>{presenceText}</TooltipContent>
+                    </Tooltip>
 
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
