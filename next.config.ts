@@ -62,6 +62,23 @@ const SECURITY_HEADERS = [
 
 const nextConfig: NextConfig = {
   /**
+   * Dev-only cross-origin allowlist.
+   *
+   * Next.js 16 blocks cross-origin requests to dev-only assets and
+   * endpoints by default. When the app is reached through an ngrok
+   * tunnel (for Meta webhook testing), the browser loads the page
+   * from the *.ngrok-free.app host while the dev server was started
+   * on localhost — so HMR and /_next/* dev assets get blocked unless
+   * the tunnel host is allowlisted here. Ignored in production.
+   */
+  allowedDevOrigins: [
+    "*.ngrok-free.dev",
+    "*.ngrok-free.app",
+    "*.ngrok.io",
+    "*.ngrok.app",
+  ],
+
+  /**
    * Cache-Control policy.
    *
    * Why this exists:
