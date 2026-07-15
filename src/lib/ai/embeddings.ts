@@ -13,9 +13,15 @@ import { providerHttpError, toNetworkError } from './providers/shared'
 // migration 030.
 // ============================================================
 
-const OPENAI_EMBEDDINGS_URL = 'https://api.openai.com/v1/embeddings'
+// Google Gemini's OpenAI-compatible embeddings endpoint — accepts a
+// Gemini API key (AIza...) as the Bearer token. `dimensions: 1536` is
+// requested explicitly (Gemini defaults to 3072) so vectors fit the
+// `vector(1536)` column from migration 030. The index uses cosine
+// distance, so the non-normalized 1536-dim output is fine.
+const OPENAI_EMBEDDINGS_URL =
+  'https://generativelanguage.googleapis.com/v1beta/openai/embeddings'
 
-export const EMBEDDING_MODEL = 'text-embedding-3-small'
+export const EMBEDDING_MODEL = 'gemini-embedding-001'
 export const EMBEDDING_DIMENSIONS = 1536
 
 // OpenAI accepts an array input; keep batches modest so a big re-index
@@ -57,7 +63,11 @@ export async function embedTexts(
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ model: EMBEDDING_MODEL, input: batch }),
+        body: JSON.stringify({
+          model: EMBEDDING_MODEL,
+          input: batch,
+          dimensions: EMBEDDING_DIMENSIONS,
+        }),
         signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (err) {
