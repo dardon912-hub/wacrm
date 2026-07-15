@@ -7,7 +7,10 @@ import {
   type ProviderArgs,
 } from './shared'
 
-const OPENAI_URL = 'https://api.groq.com/openai/v1/chat/completions'
+// Google Gemini's OpenAI-compatible endpoint — accepts a Gemini API
+// key (AIza...) as the Bearer token.
+const OPENAI_URL =
+  'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions'
 
 interface OpenAiResponse {
   choices?: { message?: { content?: string } }[]
@@ -36,6 +39,11 @@ export async function generateOpenAi(args: ProviderArgs): Promise<string> {
           ...mergeConsecutive(messages),
         ],
         max_completion_tokens: MAX_OUTPUT_TOKENS,
+        // Gemini 2.5 Flash "thinks" by default, which eats the token
+        // budget and can return empty replies — turn it off. (Remove
+        // this line if you switch to a model that can't disable
+        // thinking, e.g. gemini-2.5-pro.)
+        reasoning_effort: 'none',
       }),
       signal: AbortSignal.timeout(timeoutMs),
     })
