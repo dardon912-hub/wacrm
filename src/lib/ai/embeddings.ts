@@ -13,10 +13,10 @@ import { providerHttpError, toNetworkError } from './providers/shared'
 // migration 030.
 // ============================================================
 
-const OPENAI_EMBEDDINGS_URL = 'https://integrate.api.nvidia.com/v1/embeddings'
+const OPENAI_EMBEDDINGS_URL = 'https://api.openai.com/v1/embeddings'
 
-export const EMBEDDING_MODEL = 'nvidia/nv-embedqa-e5-v5'
-export const EMBEDDING_DIMENSIONS = 1024
+export const EMBEDDING_MODEL = 'text-embedding-3-small'
+export const EMBEDDING_DIMENSIONS = 1536
 
 // OpenAI accepts an array input; keep batches modest so a big re-index
 // stays under request-size limits and partial failures are cheap.
