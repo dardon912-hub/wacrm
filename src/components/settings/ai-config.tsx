@@ -83,14 +83,17 @@ export function AiConfig() {
       if (data.configured) {
         setConfigured(true);
         setProvider(data.provider);
-        // If the stored model is no longer valid for the stored provider
-        // (e.g. a leftover from a previous provider like llama-3.1-8b-instant),
-        // silently reset it to the current default so the user sees something
-        // sensible without having to clear it manually.
-        const knownModels = Object.values(AI_PROVIDER_DEFAULT_MODEL);
+        // Replace any deprecated/retired model IDs with the current default
+        // for the stored provider. This covers both unknown third-party models
+        // (e.g. llama-3.1-8b-instant) and models we've retired ourselves
+        // (e.g. gemini-2.5-flash → gemini-3.5-flash).
+        const DEPRECATED_MODELS = ['gemini-2.5-flash', 'llama-3.1-8b-instant'];
+        const knownCurrentModels = Object.values(AI_PROVIDER_DEFAULT_MODEL);
         const storedModel: string = data.model ?? '';
+        const isDeprecated = DEPRECATED_MODELS.includes(storedModel);
+        const isKnownCurrent = storedModel && knownCurrentModels.includes(storedModel);
         const modelForProvider =
-          storedModel && knownModels.includes(storedModel)
+          !isDeprecated && isKnownCurrent
             ? storedModel
             : AI_PROVIDER_DEFAULT_MODEL[data.provider as AiProvider] ??
             AI_PROVIDER_DEFAULT_MODEL.openai;
