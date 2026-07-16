@@ -13,6 +13,7 @@ import type { AiProvider } from './types'
 export const AI_PROVIDER_DEFAULT_MODEL: Record<AiProvider, string> = {
   openai: 'gemini-2.0-flash',
   anthropic: 'claude-haiku-4-5-20251001',
+  groq: 'llama-3.3-70b-versatile',
 }
 
 /**
