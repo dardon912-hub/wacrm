@@ -83,7 +83,18 @@ export function AiConfig() {
       if (data.configured) {
         setConfigured(true);
         setProvider(data.provider);
-        setModel(data.model);
+        // If the stored model is no longer valid for the stored provider
+        // (e.g. a leftover from a previous provider like llama-3.1-8b-instant),
+        // silently reset it to the current default so the user sees something
+        // sensible without having to clear it manually.
+        const knownModels = Object.values(AI_PROVIDER_DEFAULT_MODEL);
+        const storedModel: string = data.model ?? '';
+        const modelForProvider =
+          storedModel && knownModels.includes(storedModel)
+            ? storedModel
+            : AI_PROVIDER_DEFAULT_MODEL[data.provider as AiProvider] ??
+            AI_PROVIDER_DEFAULT_MODEL.openai;
+        setModel(modelForProvider);
         setSystemPrompt(data.system_prompt ?? '');
         setIsActive(data.is_active);
         setAutoReplyEnabled(data.auto_reply_enabled);
@@ -108,15 +119,15 @@ export function AiConfig() {
     void fetchConfig();
   }, [accountId, fetchConfig]);
 
-  // Swap the model default when the provider changes, unless the user
-  // typed a custom model.
+  // Swap the model default when the provider changes. Always reset to
+  // the new provider's default unless the user has already typed a
+  // custom value that differs from every known default (meaning they
+  // intentionally picked a non-default model for the *new* provider).
   const handleProviderChange = (next: AiProvider) => {
     setProvider(next);
-    const isDefaultModel =
-      model === AI_PROVIDER_DEFAULT_MODEL.openai ||
-      model === AI_PROVIDER_DEFAULT_MODEL.anthropic ||
-      model.trim() === '';
-    if (isDefaultModel) setModel(AI_PROVIDER_DEFAULT_MODEL[next]);
+    const knownModels = Object.values(AI_PROVIDER_DEFAULT_MODEL);
+    const isKnownOrEmpty = !model.trim() || knownModels.includes(model.trim());
+    if (isKnownOrEmpty) setModel(AI_PROVIDER_DEFAULT_MODEL[next]);
   };
 
   const keyPayload = () => (keyEdited ? apiKey.trim() : undefined);
