@@ -41,11 +41,6 @@ export async function generateOpenAi(args: ProviderArgs): Promise<string> {
         // Gemini's OpenAI-compat layer uses `max_tokens`, not the newer
         // `max_completion_tokens` name that the native OpenAI API accepts.
         max_tokens: MAX_OUTPUT_TOKENS,
-        // Gemini 2.5 Flash "thinks" by default, which eats the token
-        // budget and can return empty replies — turn it off. (Remove
-        // this line if you switch to a model that can't disable
-        // thinking, e.g. gemini-2.5-pro.)
-        reasoning_effort: 'none',
       }),
       signal: AbortSignal.timeout(timeoutMs),
     })
