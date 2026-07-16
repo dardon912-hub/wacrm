@@ -1,36 +1,38 @@
 import { AiError } from './types'
 import { aiRequestTimeoutMs } from './defaults'
-import { providerHttpError, toNetworkError } from './providers/shared'
+import { toNetworkError } from './providers/shared'
 
 // ============================================================
-// Embeddings (OpenAI-compatible).
+// Embeddings via the native Gemini batchEmbedContents API.
 //
-// Used for the knowledge base's optional semantic-search path: embed
-// each chunk at ingest, and embed the query at retrieval. Anthropic has
-// no embeddings endpoint, so this is always OpenAI's — the account
-// supplies a (possibly separate) embeddings key. 1536-dim
-// text-embedding-3-small matches the `vector(1536)` column in
-// migration 030.
+// We deliberately bypass the OpenAI-compat embeddings path
+// (v1beta/openai/embeddings) because that layer does not reliably
+// honour the `dimensions` parameter for gemini-embedding-001, which
+// causes 404s. The native API supports `outputDimensionality` properly
+// and lets us keep the `vector(1536)` pgvector column from migration
+// 030 without a schema change.
+//
+// Auth: Gemini API key (AIza…) passed as a query-string param — the
+// same key the user stores in the "Embeddings key" field.
 // ============================================================
 
-// Google Gemini's OpenAI-compatible embeddings endpoint — accepts a
-// Gemini API key (AIza...) as the Bearer token. `dimensions: 1536` is
-// requested explicitly (Gemini defaults to 3072) so vectors fit the
-// `vector(1536)` column from migration 030. The index uses cosine
-// distance, so the non-normalized 1536-dim output is fine.
-const OPENAI_EMBEDDINGS_URL =
-  'https://generativelanguage.googleapis.com/v1beta/openai/embeddings'
+const GEMINI_EMBEDDINGS_BASE =
+  'https://generativelanguage.googleapis.com/v1beta/models'
 
 export const EMBEDDING_MODEL = 'gemini-embedding-001'
 export const EMBEDDING_DIMENSIONS = 1536
 
-// OpenAI accepts an array input; keep batches modest so a big re-index
-// stays under request-size limits and partial failures are cheap.
+// Keep batches modest so a big re-index stays under request-size
+// limits and partial failures are cheap to retry.
 const BATCH_SIZE = 96
 
-interface EmbeddingResponse {
-  data?: { embedding?: number[]; index?: number }[]
+// ---- Native API response shapes --------------------------------
+
+interface BatchEmbedResponse {
+  embeddings?: { values?: number[] }[]
 }
+
+// ----------------------------------------------------------------
 
 /** Format a vector for a pgvector column / RPC param: `[0.1,0.2,...]`.
  *  PostgREST casts this text literal to `vector`; a raw JS array does
@@ -40,9 +42,10 @@ export function toVectorLiteral(embedding: number[]): string {
 }
 
 /**
- * Embed a list of strings, preserving input order. Batched; throws
- * `AiError` on provider/network failure so callers can decide whether
- * to degrade (retrieval) or surface (ingest).
+ * Embed a list of strings using the native Gemini batchEmbedContents
+ * endpoint, preserving input order. Batched; throws `AiError` on
+ * provider/network failure so callers can decide whether to degrade
+ * (retrieval) or surface (ingest).
  */
 export async function embedTexts(
   apiKey: string,
@@ -55,19 +58,23 @@ export async function embedTexts(
   for (let start = 0; start < inputs.length; start += BATCH_SIZE) {
     const batch = inputs.slice(start, start + BATCH_SIZE)
 
+    // Each request in the batch wraps a single string as a Content
+    // object. outputDimensionality trims the 3072-dim native output to
+    // 1536 so vectors fit the `vector(1536)` pgvector column.
+    const requests = batch.map((text) => ({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text }] },
+      outputDimensionality: EMBEDDING_DIMENSIONS,
+    }))
+
+    const url = `${GEMINI_EMBEDDINGS_BASE}/${EMBEDDING_MODEL}:batchEmbedContents?key=${encodeURIComponent(apiKey)}`
+
     let res: Response
     try {
-      res = await fetch(OPENAI_EMBEDDINGS_URL, {
+      res = await fetch(url, {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: EMBEDDING_MODEL,
-          input: batch,
-          dimensions: EMBEDDING_DIMENSIONS,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requests }),
         signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (err) {
@@ -75,34 +82,55 @@ export async function embedTexts(
     }
 
     if (!res.ok) {
-      throw await providerHttpError('OpenAI embeddings', res)
+      // Mirror the shape of providerHttpError but for the native API.
+      let detail = ''
+      try {
+        const body = (await res.json()) as {
+          error?: { message?: string } | string
+        }
+        detail =
+          typeof body?.error === 'string'
+            ? body.error
+            : (body?.error?.message ?? '')
+      } catch {
+        // Non-JSON body — fall through to status-only message.
+      }
+
+      const { status } = res
+      const code =
+        status === 401 || status === 403
+          ? 'invalid_key'
+          : status === 429
+            ? 'rate_limited'
+            : 'provider_error'
+      const base =
+        code === 'invalid_key'
+          ? 'Gemini rejected the embeddings API key'
+          : code === 'rate_limited'
+            ? 'Gemini embeddings rate limit reached'
+            : `Gemini embeddings API error (${status})`
+
+      throw new AiError(detail ? `${base}: ${detail}` : base, {
+        code,
+        status: code === 'invalid_key' ? 401 : 502,
+      })
     }
 
-    const data = (await res.json().catch(() => null)) as EmbeddingResponse | null
-    const rows = data?.data
+    const data = (await res.json().catch(() => null)) as BatchEmbedResponse | null
+    const rows = data?.embeddings
     if (!rows || rows.length !== batch.length) {
-      throw new AiError('Embeddings response was malformed.', {
+      throw new AiError('Gemini embeddings response was malformed.', {
         code: 'embeddings_malformed',
       })
     }
 
-    // Sort by index so order matches the input batch regardless of how
-    // the provider returns them. Require a real numeric index — defaulting
-    // a missing one to 0 would silently misalign chunks with their
-    // vectors (chunk N gets chunk M's embedding), so fail loud instead.
-    if (rows.some((r) => typeof r.index !== 'number')) {
-      throw new AiError('Embeddings response was missing result indices.', {
-        code: 'embeddings_malformed',
-      })
-    }
-    const ordered = [...rows].sort((a, b) => a.index! - b.index!)
-    for (const r of ordered) {
-      if (!Array.isArray(r.embedding)) {
-        throw new AiError('Embeddings response missing a vector.', {
+    for (const r of rows) {
+      if (!Array.isArray(r.values)) {
+        throw new AiError('Gemini embeddings response missing a vector.', {
           code: 'embeddings_malformed',
         })
       }
-      out.push(r.embedding)
+      out.push(r.values)
     }
   }
 

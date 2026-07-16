@@ -38,7 +38,9 @@ export async function generateOpenAi(args: ProviderArgs): Promise<string> {
           { role: 'system', content: systemPrompt },
           ...mergeConsecutive(messages),
         ],
-        max_completion_tokens: MAX_OUTPUT_TOKENS,
+        // Gemini's OpenAI-compat layer uses `max_tokens`, not the newer
+        // `max_completion_tokens` name that the native OpenAI API accepts.
+        max_tokens: MAX_OUTPUT_TOKENS,
         // Gemini 2.5 Flash "thinks" by default, which eats the token
         // budget and can return empty replies — turn it off. (Remove
         // this line if you switch to a model that can't disable
@@ -52,13 +54,13 @@ export async function generateOpenAi(args: ProviderArgs): Promise<string> {
   }
 
   if (!res.ok) {
-    throw await providerHttpError('OpenAI', res)
+    throw await providerHttpError('Gemini', res)
   }
 
   const data = (await res.json().catch(() => null)) as OpenAiResponse | null
   const text = data?.choices?.[0]?.message?.content
   if (!text || typeof text !== 'string' || !text.trim()) {
-    throw new AiError('OpenAI returned an empty response.', {
+    throw new AiError('Gemini returned an empty response.', {
       code: 'empty_response',
     })
   }

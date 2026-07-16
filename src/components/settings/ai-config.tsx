@@ -32,12 +32,12 @@ import type { AiProvider } from '@/lib/ai/types';
 const MASKED_KEY = '••••••••••••••••';
 
 const PROVIDER_LABEL: Record<AiProvider, string> = {
-  openai: 'OpenAI',
+  openai: 'Google Gemini (via OpenAI-compat)',
   anthropic: 'Anthropic (Claude)',
 };
 
 const KEY_PLACEHOLDER: Record<AiProvider, string> = {
-  openai: 'sk-...',
+  openai: 'AIzaSy...',
   anthropic: 'sk-ant-...',
 };
 
@@ -226,7 +226,7 @@ export function AiConfig() {
     <div>
       <SettingsPanelHead
         title="Agent setup"
-        description="Bring your own OpenAI or Anthropic key. wacrm calls the provider directly with your key — no per-seat AI fees, and your data stays yours. This powers AI-drafted replies in the inbox, the auto-reply bot, and the Playground."
+        description="Bring your own API key (Google Gemini or Anthropic). wacrm calls the provider directly with your key — no per-seat AI fees, and your data stays yours. This powers AI-drafted replies in the inbox, the auto-reply bot, and the Playground."
       />
 
       {!canEdit && (
@@ -350,15 +350,23 @@ export function AiConfig() {
                     setEmbeddingsKeyEdited(true);
                   }
                 }}
-                placeholder="sk-... (OpenAI)"
+                placeholder="AIzaSy..."
                 disabled={disabled}
                 autoComplete="off"
               />
               <p className="text-xs text-muted-foreground">
-                An OpenAI key used only to embed your knowledge base
-                (text-embedding-3-small)
-                {provider === 'openai' ? ' — can be the same key as above' : ''}.
-                Leave blank to use keyword search instead. Clear it to turn
+                Google AI Studio key used to embed your knowledge base
+                (gemini-embedding-001){provider === 'openai' ? ' — can be the same key as above' : ''}.
+                Get one free at{' '}
+                <a
+                  href="https://aistudio.google.com/apikey"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  aistudio.google.com/apikey
+                </a>
+                . Leave blank to use keyword search instead. Clear it to turn
                 semantic search off.
               </p>
             </div>
