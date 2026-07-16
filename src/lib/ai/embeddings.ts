@@ -14,6 +14,10 @@ import { toNetworkError } from './providers/shared'
 //
 // Auth: Gemini API key (AIza…) passed as a query-string param — the
 // same key the user stores in the "Embeddings key" field.
+//
+// Rate limits (free tier): gemini-embedding-001 allows 5 RPM.
+// We enforce a minimum inter-batch gap and retry 429s with exponential
+// backoff so large re-indexes don't blow the quota.
 // ============================================================
 
 const GEMINI_EMBEDDINGS_BASE =
@@ -22,9 +26,17 @@ const GEMINI_EMBEDDINGS_BASE =
 export const EMBEDDING_MODEL = 'gemini-embedding-001'
 export const EMBEDDING_DIMENSIONS = 1536
 
-// Keep batches modest so a big re-index stays under request-size
-// limits and partial failures are cheap to retry.
-const BATCH_SIZE = 96
+// Keep batches small on the free tier (5 RPM). Each batch = 1 request.
+// With BATCH_SIZE=10 and MIN_BATCH_GAP_MS=13_000 we stay well under 5 RPM.
+const BATCH_SIZE = 10
+
+// Minimum wait between consecutive batch requests (ms).
+// 5 RPM = 1 request per 12 s → use 13 s to give headroom.
+const MIN_BATCH_GAP_MS = 13_000
+
+// Retry config for 429 responses.
+const MAX_RETRIES = 4
+const RETRY_BASE_MS = 15_000 // 15 s initial back-off, doubles each retry
 
 // ---- Native API response shapes --------------------------------
 
@@ -41,34 +53,24 @@ export function toVectorLiteral(embedding: number[]): string {
   return `[${embedding.join(',')}]`
 }
 
+/** Sleep for `ms` milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 /**
- * Embed a list of strings using the native Gemini batchEmbedContents
- * endpoint, preserving input order. Batched; throws `AiError` on
- * provider/network failure so callers can decide whether to degrade
- * (retrieval) or surface (ingest).
+ * Fetch one batch with automatic 429-retry + exponential back-off.
+ * Throws `AiError` on non-retryable failures.
  */
-export async function embedTexts(
-  apiKey: string,
-  inputs: string[],
+async function fetchBatch(
+  url: string,
+  requests: object[],
+  timeoutMs: number,
+  batchSize: number,
 ): Promise<number[][]> {
-  if (inputs.length === 0) return []
-  const timeoutMs = aiRequestTimeoutMs()
-  const out: number[][] = []
+  let attempt = 0
 
-  for (let start = 0; start < inputs.length; start += BATCH_SIZE) {
-    const batch = inputs.slice(start, start + BATCH_SIZE)
-
-    // Each request in the batch wraps a single string as a Content
-    // object. outputDimensionality trims the 3072-dim native output to
-    // 1536 so vectors fit the `vector(1536)` pgvector column.
-    const requests = batch.map((text) => ({
-      model: `models/${EMBEDDING_MODEL}`,
-      content: { parts: [{ text }] },
-      outputDimensionality: EMBEDDING_DIMENSIONS,
-    }))
-
-    const url = `${GEMINI_EMBEDDINGS_BASE}/${EMBEDDING_MODEL}:batchEmbedContents?key=${encodeURIComponent(apiKey)}`
-
+  while (true) {
     let res: Response
     try {
       res = await fetch(url, {
@@ -81,8 +83,18 @@ export async function embedTexts(
       throw toNetworkError(err)
     }
 
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      // Respect Retry-After header if present, otherwise use exponential back-off.
+      const retryAfter = res.headers.get('Retry-After')
+      const waitMs = retryAfter
+        ? Number(retryAfter) * 1000
+        : RETRY_BASE_MS * Math.pow(2, attempt)
+      attempt++
+      await sleep(waitMs)
+      continue
+    }
+
     if (!res.ok) {
-      // Mirror the shape of providerHttpError but for the native API.
       let detail = ''
       try {
         const body = (await res.json()) as {
@@ -107,7 +119,7 @@ export async function embedTexts(
         code === 'invalid_key'
           ? 'Gemini rejected the embeddings API key'
           : code === 'rate_limited'
-            ? 'Gemini embeddings rate limit reached'
+            ? 'Gemini embeddings rate limit reached — try again in a minute'
             : `Gemini embeddings API error (${status})`
 
       throw new AiError(detail ? `${base}: ${detail}` : base, {
@@ -118,12 +130,13 @@ export async function embedTexts(
 
     const data = (await res.json().catch(() => null)) as BatchEmbedResponse | null
     const rows = data?.embeddings
-    if (!rows || rows.length !== batch.length) {
+    if (!rows || rows.length !== batchSize) {
       throw new AiError('Gemini embeddings response was malformed.', {
         code: 'embeddings_malformed',
       })
     }
 
+    const out: number[][] = []
     for (const r of rows) {
       if (!Array.isArray(r.values)) {
         throw new AiError('Gemini embeddings response missing a vector.', {
@@ -132,6 +145,46 @@ export async function embedTexts(
       }
       out.push(r.values)
     }
+    return out
+  }
+}
+
+/**
+ * Embed a list of strings using the native Gemini batchEmbedContents
+ * endpoint, preserving input order. Batched with inter-batch pacing and
+ * 429-retry so the free-tier 5 RPM limit is never exceeded. Throws
+ * `AiError` on non-retryable provider/network failure.
+ */
+export async function embedTexts(
+  apiKey: string,
+  inputs: string[],
+): Promise<number[][]> {
+  if (inputs.length === 0) return []
+  const timeoutMs = aiRequestTimeoutMs()
+  const out: number[][] = []
+  let lastRequestAt = 0
+
+  for (let start = 0; start < inputs.length; start += BATCH_SIZE) {
+    const batch = inputs.slice(start, start + BATCH_SIZE)
+
+    // Enforce minimum gap between requests to stay under 5 RPM.
+    const now = Date.now()
+    const elapsed = now - lastRequestAt
+    if (lastRequestAt > 0 && elapsed < MIN_BATCH_GAP_MS) {
+      await sleep(MIN_BATCH_GAP_MS - elapsed)
+    }
+
+    const requests = batch.map((text) => ({
+      model: `models/${EMBEDDING_MODEL}`,
+      content: { parts: [{ text }] },
+      outputDimensionality: EMBEDDING_DIMENSIONS,
+    }))
+
+    const url = `${GEMINI_EMBEDDINGS_BASE}/${EMBEDDING_MODEL}:batchEmbedContents?key=${encodeURIComponent(apiKey)}`
+
+    lastRequestAt = Date.now()
+    const vectors = await fetchBatch(url, requests, timeoutMs, batch.length)
+    out.push(...vectors)
   }
 
   return out
