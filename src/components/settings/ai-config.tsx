@@ -87,7 +87,7 @@ export function AiConfig() {
         // for the stored provider. This covers both unknown third-party models
         // (e.g. llama-3.1-8b-instant) and models we've retired ourselves
         // (e.g. gemini-2.5-flash → gemini-3.5-flash).
-        const DEPRECATED_MODELS = ['gemini-2.5-flash', 'llama-3.1-8b-instant'];
+        const DEPRECATED_MODELS = ['gemini-2.5-flash', 'gemini-3.5-flash', 'llama-3.1-8b-instant'];
         const knownCurrentModels = Object.values(AI_PROVIDER_DEFAULT_MODEL);
         const storedModel: string = data.model ?? '';
         const isDeprecated = DEPRECATED_MODELS.includes(storedModel);
